@@ -2692,7 +2692,8 @@ async function 反代参数获取(request) {
     let 查询反代IP = searchParams.get('proxyip');
     // 👆 ------------------------------------------ 👆
     if (查询反代IP !== null) {
-        if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
+        查询反代IP = await 获取最快IP(查询反代IP); // 执行测速筛选
+		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
     } else {
         let 匹配 = /\/(socks5?|http):\/?\/?([^/?#\s]+)/i.exec(pathname);
         if (匹配) {
@@ -2705,7 +2706,8 @@ async function 反代参数获取(request) {
             启用SOCKS5反代 = 类型.includes('http') ? 'http' : 'socks5';
             if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
         } else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
-            const 路径反代值 = 提取路径值(匹配[2]);
+            let 路径反代值 = 提取路径值(匹配[2]); //将原本的 const 变为 let
+            路径反代值 = await 获取最快IP(路径反代值); // 执行测速筛选
             if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
         }
     }
