@@ -2637,63 +2637,23 @@ async function 反代参数获取(request) {
         const 斜杠索引 = 协议拆分[1].indexOf('/');
         return 斜杠索引 > 0 ? `${协议拆分[0]}://${协议拆分[1].slice(0, 斜杠索引)}` : 值;
     };
-// 👇 --- 新增：并发测速并选择最快 IP 的核心逻辑 --- 👇
-    const 测试节点延迟 = async (地址端口, 超时毫秒 = 500) => {
-        const start = Date.now();
-        let 主机 = 地址端口, 端口 = 443;
-        
-        // 简单解析 IP 和端口 (兼容 IPv4 和 IPv6)
-        if (地址端口.includes(':') && !地址端口.startsWith('[')) {
-            const parts = 地址端口.split(':');
-            主机 = parts[0]; 端口 = parseInt(parts[1]) || 443;
-        } else if (地址端口.includes(']:')) {
-            const parts = 地址端口.split(']:');
-            主机 = parts[0] + ']'; 端口 = parseInt(parts[1]) || 443;
+    
+    // 👇 --- 这是你新增的：处理逗号多IP的辅助函数 --- 👇
+    const 随机抽取IP = (值) => {
+        if (值.includes(',')) {
+            const ipArray = 值.split(',');
+            return ipArray[Math.floor(Math.random() * ipArray.length)].trim();
         }
-
-        try {
-            // 利用 Cloudflare 原生 Socket 进行 TCP 握手测速
-            const socket = connect({ hostname: 主机, port: 端口 });
-            await Promise.race([
-                socket.opened,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 超时毫秒))
-            ]);
-            const 延迟 = Date.now() - start;
-            try { socket.close(); } catch(e){} // 测速完毕立刻关闭
-            return 延迟;
-        } catch (e) {
-            return Infinity; // 连接失败或超时
-        }
+        return 值;
     };
-
-    const 获取最快IP = async (多IP字符串) => {
-        if (!多IP字符串.includes(',')) return 多IP字符串;
-        
-        const ipArray = 多IP字符串.split(',').map(ip => ip.trim()).filter(Boolean);
-        if (ipArray.length === 0) return 多IP字符串;
-
-        // 并发测试所有 IP
-        const 测试结果 = await Promise.all(ipArray.map(async (ip) => {
-            return { ip, 延迟: await 测试节点延迟(ip) };
-        }));
-
-        // 过滤掉超时的，按延迟从小到大排序
-        const 有效结果 = 测试结果.filter(res => res.延迟 !== Infinity).sort((a, b) => a.延迟 - b.延迟);
-
-        if (有效结果.length > 0) {
-            console.log(`[智能优选] 选出最快IP: ${有效结果[0].ip} (延迟: ${有效结果[0].延迟}ms)`);
-            return 有效结果[0].ip;
-        } else {
-            console.log(`[智能优选] 所有IP均超时，回退到随机模式`);
-            return ipArray[Math.floor(Math.random() * ipArray.length)];
-        }
-    };
+    
+    
     // 注意：把原来的 const 查询反代IP 改成 let，方便重新赋值
     let 查询反代IP = searchParams.get('proxyip');
     // 👆 ------------------------------------------ 👆
+    
     if (查询反代IP !== null) {
-        查询反代IP = await 获取最快IP(查询反代IP); // 执行测速筛选
-		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
+        if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
     } else {
         let 匹配 = /\/(socks5?|http):\/?\/?([^/?#\s]+)/i.exec(pathname);
         if (匹配) {
@@ -2706,8 +2666,8 @@ async function 反代参数获取(request) {
             启用SOCKS5反代 = 类型.includes('http') ? 'http' : 'socks5';
             if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
         } else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
-            let 路径反代值 = 提取路径值(匹配[2]); //将原本的 const 变为 let
-            路径反代值 = await 获取最快IP(路径反代值); // 执行测速筛选
+            let 路径反代值 = 提取路径值(匹配[2]); // 注意：把原来的 const 路径反代值 改成 let
+            路径反代值 = 随机抽取IP(路径反代值); // 增加随机逻辑
             if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
         }
     }
