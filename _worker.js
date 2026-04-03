@@ -2674,7 +2674,15 @@ async function 反代参数获取(request) {
 		return 斜杠索引 > 0 ? `${协议拆分[0]}://${协议拆分[1].slice(0, 斜杠索引)}` : 值;
 	};
 
-	const 查询反代IP = searchParams.get('proxyip');
+	// 👇 --- 改变的代码：处理逗号多IP的辅助函数 --- 👇
+	const 随机抽取IP = (值) => {
+        if (值.includes(',')) {
+            const ipArray = 值.split(',');
+            return ipArray[Math.floor(Math.random() * ipArray.length)].trim();
+        }
+        return 值;
+    };
+	let 查询反代IP = searchParams.get('proxyip'); //新增代码：把原来的 const 查询反代IP 改成 let，方便重新赋值
 	if (查询反代IP !== null) {
 		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
 	} else {
@@ -2690,8 +2698,13 @@ async function 反代参数获取(request) {
 			启用SOCKS5反代 = 类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5');
 			if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
 		} else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
-			const 路径反代值 = 提取路径值(匹配[2]);
+			// 新增代码：把原来的 const 路径反代值 改成 let
+			let 路径反代值 = 提取路径值(匹配[2]); 
+			// 新增代码：增加随机逻辑
+			路径反代值 = 随机抽取IP(路径反代值); 
 			if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
+	// 👆 ------------------------------------------ 👆
+
 		}
 	}
 
