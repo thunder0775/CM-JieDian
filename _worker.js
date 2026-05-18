@@ -5477,8 +5477,7 @@ async function 反代参数获取(url, uuid) {
 
 	// 👇 --- 这是你新增的：处理逗号多IP的辅助函数 --- 👇
     const 随机抽取IP = (值) => {
-        if (!原始值 || typeof 原始值 !== 'string') return 原始值;
-        let 值 = 原始值.trim();
+        if (!值 || typeof 值 !== 'string') return 值;
         if (值.includes('?')) {值 = 值.split('?')[0].trim();}
 		if (值.includes(',')) {
 			const ipArray = 值.split(',').map(item => item.trim()).filter(Boolean);
