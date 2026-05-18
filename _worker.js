@@ -5477,17 +5477,21 @@ async function 反代参数获取(url, uuid) {
 
 	// 👇 --- 这是你新增的：处理逗号多IP的辅助函数 --- 👇
     const 随机抽取IP = (值) => {
-        if (值.includes(',')) {
-            const ipArray = 值.split(',');
-            return ipArray[Math.floor(Math.random() * ipArray.length)].trim();
-        }
-        return 值;
+        if (!值 || typeof 值 !== 'string') return 值;
+		if (值.includes(',')) {
+			const ipArray = 值.split(',').map(item => item.trim()).filter(Boolean);
+			if (ipArray.length > 1) {
+				const 选中的 = ipArray[Math.floor(Math.random() * ipArray.length)];
+				return 选中的;
+			}
+		}
+		return 值.trim();
     };
-    
 	// 注意：把原来的 const 查询反代IP 改成 let，方便重新赋值-你新增
 	let 查询反代IP = searchParams.get('proxyip');
-	// 👆 ------------------------------------------ 👆
 	if (查询反代IP !== null) {
+		查询反代IP = 随机抽取IP(查询反代IP); // 增加随机逻辑-你新增
+	// 👆 ------------------------------------------ 👆
 		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
 	} else {
 		let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
