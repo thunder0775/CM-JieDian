@@ -1,44 +1,80 @@
 name: Upstream Sync
 
+# 只同步到 main，不创建任何临时分支。
+# 无冲突：自动合并并推送到 main。
+# 有冲突：立即停止，不推送，不破坏现有 main。
+
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    # 每天 00:00 UTC 执行（北京时间/台北时间 08:00）
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    name: Sync cmliu/edgetunnel -> main
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
 
     steps:
-      - name: Checkout target repo
+      - name: Checkout main
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: main
+          persist-credentials: true
 
-      - name: Sync upstream changes
+      - name: Configure Git
         run: |
-          git config user.name "GH Action - Upstream Sync"
-          git config user.email "action@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Fetch upstream
+        run: |
+          git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/cmliu/edgetunnel.git
-          git fetch upstream main
+          git fetch --prune upstream main
 
-          if git diff --quiet HEAD upstream/main; then
-            # 内容和上游一致，直接对齐，顺带清理历史分叉留下的多余 merge commit
-            git reset --hard upstream/main
-            git push --force-with-lease origin main
+      - name: Check whether upstream has new commits
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "当前 main 已包含上游最新提交，无需同步。"
           else
-            # 有本地修改，保持原来的合并方式，不覆盖任何人的改动
-            if ! git pull --no-rebase upstream main; then
-              echo "[Error] 合并上游变更产生冲突，自动同步已暂停，请手动 Sync Fork 并解决冲突。"
-              echo "[Error] Merge conflict detected while syncing upstream. Please sync your fork manually and resolve the conflicts."
-              exit 1
-            fi
-            git push origin main
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "检测到上游存在新提交，开始合并。"
           fi
+
+      - name: Merge upstream into main
+        if: steps.check.outputs.up_to_date != 'true'
+        run: |
+          set -e
+
+          echo "当前 main:    $(git rev-parse HEAD)"
+          echo "上游 main:    $(git rev-parse upstream/main)"
+
+          if git merge --no-edit upstream/main; then
+            echo "上游更新已成功合并到 main。"
+          else
+            echo ""
+            echo "========================================"
+            echo "上游同步发生冲突。"
+            echo "不会推送任何内容，现有 main 保持不变。"
+            echo "请手动解决冲突后再次运行本工作流。"
+            echo "========================================"
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Push main
+        if: steps.check.outputs.up_to_date != 'true'
+        run: |
+          git push origin main
+          echo "同步完成：CM-JieDian/main 已更新。"
