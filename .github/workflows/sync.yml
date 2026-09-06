@@ -3,7 +3,8 @@ name: Upstream Sync
 # 将 cmliu/edgetunnel/main 同步到本仓库 main。
 # 不创建任何远程临时分支，不强制覆盖 main。
 # 无冲突：自动合并并推送。
-# 有冲突或 main 在运行期间发生变化：停止，不推送。
+# 有冲突：停止并保留远程 main。
+# 特别检查 _worker.js：先做无副作用的三方合并预检。
 
 permissions:
   contents: write
@@ -76,6 +77,64 @@ jobs:
             echo "上游相对本地新增提交数: $(git rev-list --count HEAD..upstream/main)"
           fi
 
+      - name: Preflight _worker.js conflict check
+        if: steps.check.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "检查 _worker.js 是否存在合并冲突"
+          echo "========================================"
+
+          BASE="$(git merge-base HEAD upstream/main)"
+          echo "共同基线: ${BASE}"
+
+          LOCAL_CHANGED="false"
+          UPSTREAM_CHANGED="false"
+
+          if ! git diff --quiet "${BASE}" HEAD -- _worker.js; then
+            LOCAL_CHANGED="true"
+          fi
+          if ! git diff --quiet "${BASE}" upstream/main -- _worker.js; then
+            UPSTREAM_CHANGED="true"
+          fi
+
+          echo "本地 _worker.js 是否修改: ${LOCAL_CHANGED}"
+          echo "上游 _worker.js 是否修改: ${UPSTREAM_CHANGED}"
+
+          # 使用 Git 原生三方合并预检，不修改工作区、不创建提交。
+          # --write-tree 成功 = 可以自动合并；失败 = 存在真实冲突。
+          MERGE_TREE_OUTPUT="$(git merge-tree --write-tree HEAD upstream/main 2>&1)" || MERGE_TREE_STATUS=$?
+          MERGE_TREE_STATUS="${MERGE_TREE_STATUS:-0}"
+
+          if [ "${MERGE_TREE_STATUS}" -ne 0 ]; then
+            echo "Git 检测到合并冲突。"
+            echo "${MERGE_TREE_OUTPUT}"
+
+            if printf '%s\n' "${MERGE_TREE_OUTPUT}" | grep -Eq '(^|[ /])_worker\.js($|[ :])'; then
+              echo ""
+              echo "[重点] _worker.js 存在真实合并冲突。"
+              echo "禁止自动选择 ours/theirs，禁止覆盖你的修改。"
+            else
+              echo "[重点] _worker.js 本身没有被 Git 标记为冲突；冲突发生在其他文件。"
+            fi
+
+            exit 1
+          fi
+
+          if [ "${LOCAL_CHANGED}" = "true" ] && [ "${UPSTREAM_CHANGED}" = "true" ]; then
+            echo "[信息] _worker.js 在本地和上游都发生过修改，但 Git 三方合并没有发现文本冲突。"
+            echo "将继续使用 Git 自动合并结果，不擅自覆盖任一方。"
+          elif [ "${UPSTREAM_CHANGED}" = "true" ]; then
+            echo "[信息] 仅上游修改了 _worker.js，可安全继承上游更新。"
+          elif [ "${LOCAL_CHANGED}" = "true" ]; then
+            echo "[信息] 仅本地修改了 _worker.js，将保留本地修改。"
+          else
+            echo "[信息] _worker.js 未发生变化。"
+          fi
+
+          echo "_worker.js 冲突预检通过。"
+
       - name: Merge upstream into main
         if: steps.check.outputs.up_to_date != 'true'
         run: |
@@ -85,12 +144,9 @@ jobs:
           if git merge --no-edit --no-ff upstream/main; then
             echo "上游更新已成功合并。"
           else
-            echo ""
-            echo "========================================"
             echo "上游同步发生真实 Git 冲突。"
             echo "不会推送冲突状态。"
             echo "现有远程 main 保持不变。"
-            echo "========================================"
             git diff --name-only --diff-filter=U || true
             git merge --abort || true
             exit 1
