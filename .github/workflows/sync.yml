@@ -1,10 +1,13 @@
 name: Upstream Sync
 
 # 将 cmliu/edgetunnel/main 同步到本仓库 main。
-# 不创建任何远程临时分支，不强制覆盖 main。
-# 无冲突：自动合并并推送。
-# 有冲突：停止并保留远程 main。
-# 特别检查 _worker.js：先做无副作用的三方合并预检。
+# 不 force push，不覆盖并行提交。
+#
+# _worker.js 策略：
+#   永远以上游版本为底，再运行 scripts/overlay-local-worker.js
+#   把本地功能（逗号多 IP 随机抽取）叠回去。
+#   禁止让 Git 对这个文件做行级自动混合。
+# 其他文件：正常三方合并；有冲突则整次停止、不推送。
 
 permissions:
   contents: write
@@ -38,6 +41,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.autocrlf false
+          git config core.eol lf
 
       - name: Fetch origin and upstream
         run: |
@@ -54,13 +59,10 @@ jobs:
           REMOTE_MAIN="$(git rev-parse origin/main)"
           echo "本次运行基准 main: ${BASE_SHA}"
           echo "当前 origin/main:   ${REMOTE_MAIN}"
-
-          # 保存本次同步的精确基准，后续所有安全检查都以它为准。
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
           if [ "${BASE_SHA}" != "${REMOTE_MAIN}" ]; then
-            echo "检测到 main 在工作流启动期间发生变化。"
-            echo "为避免覆盖用户提交，本次同步停止，不推送。"
+            echo "检测到 main 在工作流启动期间发生变化，停止以免覆盖用户提交。"
             exit 1
           fi
 
@@ -68,10 +70,8 @@ jobs:
         id: check
         run: |
           set -euo pipefail
-          LOCAL_MAIN="$(git rev-parse HEAD)"
-          UPSTREAM_MAIN="$(git rev-parse upstream/main)"
-          echo "local main:    ${LOCAL_MAIN}"
-          echo "upstream main: ${UPSTREAM_MAIN}"
+          echo "local main:    $(git rev-parse HEAD)"
+          echo "upstream main: $(git rev-parse upstream/main)"
 
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
@@ -82,98 +82,84 @@ jobs:
             echo "上游相对本地新增提交数: $(git rev-list --count HEAD..upstream/main)"
           fi
 
-      - name: Preflight _worker.js conflict check
+      - name: Merge upstream then overlay local _worker.js
         if: steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo "检查 _worker.js 是否存在合并冲突"
-          echo "========================================"
-
-          BASE="$(git merge-base HEAD upstream/main)"
-          echo "共同基线: ${BASE}"
-
-          LOCAL_CHANGED="false"
-          UPSTREAM_CHANGED="false"
-
-          if ! git diff --quiet "${BASE}" HEAD -- _worker.js; then
-            LOCAL_CHANGED="true"
-          fi
-          if ! git diff --quiet "${BASE}" upstream/main -- _worker.js; then
-            UPSTREAM_CHANGED="true"
+          if [ ! -f scripts/overlay-local-worker.js ]; then
+            echo "::error::缺少 scripts/overlay-local-worker.js，拒绝同步以免丢掉本地功能。"
+            exit 1
           fi
 
-          echo "本地 _worker.js 是否修改: ${LOCAL_CHANGED}"
-          echo "上游 _worker.js 是否修改: ${UPSTREAM_CHANGED}"
+          set +e
+          git merge --no-commit --no-ff --no-edit upstream/main
+          MERGE_STATUS=$?
+          set -e
 
-          # 使用 Git 原生三方合并预检，不修改工作区、不创建提交。
-          # --write-tree 成功 = 全仓库可以自动合并；失败 = 存在真实冲突。
-          MERGE_TREE_OUTPUT="$(git merge-tree --write-tree HEAD upstream/main 2>&1)" || MERGE_TREE_STATUS=$?
-          MERGE_TREE_STATUS="${MERGE_TREE_STATUS:-0}"
-
-          if [ "${MERGE_TREE_STATUS}" -ne 0 ]; then
-            echo "Git 检测到合并冲突。"
-            echo "${MERGE_TREE_OUTPUT}"
-
-            if printf '%s\n' "${MERGE_TREE_OUTPUT}" | grep -Eq '(^|[ /])_worker\.js($|[ :])'; then
-              echo ""
-              echo "[重点] _worker.js 存在真实合并冲突。"
-              echo "禁止自动选择 ours/theirs，禁止覆盖你的修改。"
-            else
-              echo "[重点] _worker.js 本身没有被 Git 标记为冲突；冲突发生在其他文件。"
+          if [ "${MERGE_STATUS}" -ne 0 ]; then
+            mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
+            if [ "${#CONFLICTS[@]}" -eq 0 ]; then
+              echo "git merge 失败且没有冲突文件，停止。"
+              git merge --abort || true
+              exit 1
             fi
 
-            exit 1
-          fi
+            OTHER=()
+            for f in "${CONFLICTS[@]}"; do
+              case "${f}" in
+                _worker.js|*/_worker.js) ;;
+                *) OTHER+=("${f}") ;;
+              esac
+            done
 
-          if [ "${LOCAL_CHANGED}" = "true" ] && [ "${UPSTREAM_CHANGED}" = "true" ]; then
-            echo "[信息] _worker.js 在本地和上游都发生过修改，但 Git 三方合并没有发现文本冲突。"
-            echo "将继续使用 Git 自动合并结果，不擅自覆盖任一方。"
-          elif [ "${UPSTREAM_CHANGED}" = "true" ]; then
-            echo "[信息] 仅上游修改了 _worker.js，可安全继承上游更新。"
-          elif [ "${LOCAL_CHANGED}" = "true" ]; then
-            echo "[信息] 仅本地修改了 _worker.js，将保留本地修改。"
+            if [ "${#OTHER[@]}" -gt 0 ]; then
+              echo "以下非 _worker.js 文件存在真实冲突，停止同步、不推送："
+              printf '  - %s\n' "${OTHER[@]}"
+              git merge --abort || true
+              exit 1
+            fi
+
+            echo "_worker.js 文本冲突是预期行为，将丢弃 Git 混合结果。"
           else
-            echo "[信息] _worker.js 未发生变化。"
+            echo "仓库级合并无冲突。仍然不信任 Git 对 _worker.js 的自动混合。"
           fi
 
-          echo "_worker.js 冲突预检通过。"
+          echo "以上游 _worker.js 为底，叠加本地功能..."
+          git show upstream/main:_worker.js > _worker.js
+          node scripts/overlay-local-worker.js _worker.js
+          node --check _worker.js
+          git add -- _worker.js
 
-      - name: Merge upstream into main
-        if: steps.check.outputs.up_to_date != 'true'
-        run: |
-          set -euo pipefail
-          echo "开始合并 cmliu/edgetunnel/main -> main"
+          # 避免 overlay 脚本本身在合并中被改乱
+          if git diff --name-only --diff-filter=U | grep -q 'overlay-local-worker.js'; then
+            git checkout --ours -- scripts/overlay-local-worker.js
+            git add -- scripts/overlay-local-worker.js
+          fi
 
-          if git merge --no-edit --no-ff upstream/main; then
-            echo "上游更新已成功合并。"
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit -m "sync: merge cmliu/edgetunnel and overlay local _worker.js features"
           else
-            echo "上游同步发生真实 Git 冲突。"
-            echo "不会推送冲突状态。"
-            echo "现有远程 main 保持不变。"
-            git diff --name-only --diff-filter=U || true
-            git merge --abort || true
-            exit 1
+            git commit -m "sync: overlay local _worker.js features onto upstream"
           fi
+
+          echo "上游同步 + 本地功能叠加完成。"
 
       - name: Validate merge result
         if: steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
-          echo "检查 Git 工作区..."
-
           if [ -n "$(git status --porcelain)" ]; then
-            git diff --check
+            echo "工作区不干净，禁止推送："
+            git status
+            exit 1
           fi
-
-          # 必须与本次同步开始时的 BASE_SHA 比较，不能使用 HEAD^，
-          # 否则在 fast-forward 或复杂历史下可能漏检 _worker.js。
-          if git diff --name-only "${BASE_SHA}" HEAD | grep -Eq '(^|/)_worker\.js$'; then
-            echo "检测到 _worker.js 在本次同步中发生变化，执行 Node 语法检查。"
-            node --check _worker.js
+          if git ls-files -u | grep -q .; then
+            echo "仍存在未解决冲突，禁止推送。"
+            exit 1
           fi
-
+          node --check _worker.js
+          grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
           echo "合并结果验证通过。"
 
       - name: Final safety check before push
@@ -182,20 +168,10 @@ jobs:
           set -euo pipefail
           git fetch --prune origin main
           CURRENT_ORIGIN="$(git rev-parse origin/main)"
-
           echo "本次同步基准 main: ${BASE_SHA}"
           echo "当前 origin/main:  ${CURRENT_ORIGIN}"
-
-          # 只有远程 main 仍然等于本次运行最初看到的提交，才允许推送。
-          # 防止其他用户/工作流在本次合并期间提交后被覆盖。
           if [ "${BASE_SHA}" != "${CURRENT_ORIGIN}" ]; then
-            echo "main 在合并期间发生变化。"
-            echo "为避免覆盖新提交，本次同步停止，不推送。"
-            exit 1
-          fi
-
-          if git ls-files -u | grep -q .; then
-            echo "仍存在未解决冲突，禁止推送。"
+            echo "main 在合并期间发生变化，停止以免覆盖新提交。"
             exit 1
           fi
 
@@ -204,4 +180,23 @@ jobs:
         run: |
           set -euo pipefail
           git push origin HEAD:main
-          echo "同步完成：CM-JieDian/main 已更新。"
+          echo "同步完成：main 已更新（_worker.js = 上游 + 本地多IP随机）。"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Upstream sync"
+            echo "- conclusion: \`${{ job.status }}\`"
+            echo "- HEAD: \`$(git rev-parse HEAD 2>/dev/null || echo n/a)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-failure
+          if-no-files-found: ignore
+          path: |
+            _worker.js
+            scripts/overlay-local-worker.js
