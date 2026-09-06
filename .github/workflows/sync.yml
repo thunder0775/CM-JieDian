@@ -1,22 +1,28 @@
 name: Upstream Sync
 
-# 将 cmliu/edgetunnel/main 同步到本仓库 main。
-# 不 force push，不覆盖并行提交。
-#
-# _worker.js 策略：
-#   永远以上游版本为底，再运行 scripts/overlay-local-worker.js
-#   把本地功能（逗号多 IP 随机抽取）叠回去。
-#   禁止让 Git 对这个文件做行级自动混合。
-# 其他文件：正常三方合并；有冲突则整次停止、不推送。
+# 最终生产同步策略：
+# 1. 只同步 main，不创建/推送同步分支。
+# 2. 普通文件：使用 Git 正常三方合并；任何真实冲突都停止，不推送。
+# 3. _worker.js：禁止使用 Git 的行级自动混合，改用 LOCAL/BASE/UPSTREAM 三方合并。
+# 4. _worker.js 真正重叠冲突时立即失败，绝不静默覆盖本地功能。
+# 5. workflow_dispatch 支持 test 模式：只读验证，不提交、不推送。
 
 permissions:
   contents: write
 
 on:
   schedule:
-    # 每天 00:00 UTC = 北京/台北时间 08:00
     - cron: "0 0 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式：test=只读验证，sync=正式同步"
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - sync
 
 concurrency:
   group: upstream-sync-main
@@ -27,6 +33,8 @@ jobs:
     name: Sync cmliu/edgetunnel -> main
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'sync' }}
 
     steps:
       - name: Checkout main
@@ -52,27 +60,196 @@ jobs:
           git fetch --prune origin main
           git fetch --prune upstream main
 
-      - name: Verify main has not changed during checkout
+      - name: Capture immutable main baseline
         run: |
           set -euo pipefail
           BASE_SHA="$(git rev-parse HEAD)"
           REMOTE_MAIN="$(git rev-parse origin/main)"
-          echo "本次运行基准 main: ${BASE_SHA}"
+          echo "本次运行 main 基准: ${BASE_SHA}"
           echo "当前 origin/main:   ${REMOTE_MAIN}"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
           if [ "${BASE_SHA}" != "${REMOTE_MAIN}" ]; then
-            echo "检测到 main 在工作流启动期间发生变化，停止以免覆盖用户提交。"
+            echo "::error::main 在工作流启动期间已经变化，停止以免覆盖新提交。"
             exit 1
           fi
 
+          echo "MODE=${MODE}"
+          case "${MODE}" in
+            test|sync) ;;
+            *)
+              echo "::error::非法运行模式: ${MODE}"
+              exit 1
+              ;;
+          esac
+
+      - name: Read-only integration preflight
+        if: env.MODE == 'test'
+        run: |
+          set -euo pipefail
+
+          TEST_DIR=".sync-test"
+          rm -rf "${TEST_DIR}"
+          mkdir -p "${TEST_DIR}"
+          trap 'rm -rf "${TEST_DIR}"' EXIT
+
+          WORKER_BASE_SHA="$(git merge-base HEAD upstream/main)"
+          echo "main LOCAL:    ${BASE_SHA}"
+          echo "upstream:      $(git rev-parse upstream/main)"
+          echo "worker BASE:   ${WORKER_BASE_SHA}"
+
+          # -------- 真实仓库 _worker.js 三方预演 --------
+          git show "HEAD:_worker.js" > "${TEST_DIR}/worker-local.js"
+          git show "${WORKER_BASE_SHA}:_worker.js" > "${TEST_DIR}/worker-base.js"
+          git show "upstream/main:_worker.js" > "${TEST_DIR}/worker-upstream.js"
+          cp -- "${TEST_DIR}/worker-local.js" "${TEST_DIR}/worker-result.js"
+
+          set +e
+          git merge-file \
+            --diff3 \
+            --marker-size=7 \
+            -L LOCAL-MAIN \
+            -L BASE \
+            -L UPSTREAM \
+            "${TEST_DIR}/worker-result.js" \
+            "${TEST_DIR}/worker-base.js" \
+            "${TEST_DIR}/worker-upstream.js"
+          MERGE_STATUS=$?
+          set -e
+
+          if [ "${MERGE_STATUS}" -eq 1 ]; then
+            echo "::error::_worker.js 当前存在真实重叠冲突；正式同步必须停止。"
+            exit 1
+          fi
+          if [ "${MERGE_STATUS}" -ne 0 ]; then
+            echo "::error::_worker.js 三方预演异常，状态码=${MERGE_STATUS}。"
+            exit "${MERGE_STATUS}"
+          fi
+
+          if grep -nE '^(<{7}|={7}|>{7})' "${TEST_DIR}/worker-result.js"; then
+            echo "::error::预演结果仍包含冲突标记。"
+            exit 1
+          fi
+
+          node --check "${TEST_DIR}/worker-result.js"
+
+          # 当前本地定制必须保留。
+          grep -q 'LOCAL-CUSTOM: random-proxyip' "${TEST_DIR}/worker-result.js"
+          grep -q "查询反代IP = searchParams.get('proxyip')" "${TEST_DIR}/worker-result.js"
+          grep -q '路径反代值 = 随机抽取IP' "${TEST_DIR}/worker-result.js"
+
+          # 当前上游关键能力必须存在。
+          grep -q 'HANDSHAKE_TYPE_CERTIFICATE_REQUEST = 13' "${TEST_DIR}/worker-result.js"
+          grep -q 'alpn=${encodeURIComponent(config_JSON.ALPN)}' "${TEST_DIR}/worker-result.js"
+          grep -q "Version = '2026-09-04 16:24:13'" "${TEST_DIR}/worker-result.js"
+
+          # 当前 main 与 upstream 已经处于“上游为祖先”的状态时，
+          # 三方结果必须至少等价于当前 main，不能因为测试自行改写 main。
+          if [ "${WORKER_BASE_SHA}" = "$(git rev-parse upstream/main)" ]; then
+            cmp -s "${TEST_DIR}/worker-result.js" "${TEST_DIR}/worker-local.js"
+          fi
+
+          # -------- 三方合并正向测试：双方改不同区域必须自动合并 --------
+          cat > "${TEST_DIR}/base-positive.txt" <<'EOF'
+line-a=BASE
+line-b=BASE
+line-c=BASE
+EOF
+          cat > "${TEST_DIR}/local-positive.txt" <<'EOF'
+line-a=LOCAL
+line-b=BASE
+line-c=BASE
+EOF
+          cat > "${TEST_DIR}/upstream-positive.txt" <<'EOF'
+line-a=BASE
+line-b=BASE
+line-c=UPSTREAM
+EOF
+          cp "${TEST_DIR}/local-positive.txt" "${TEST_DIR}/positive-result.txt"
+
+          set +e
+          git merge-file \
+            "${TEST_DIR}/positive-result.txt" \
+            "${TEST_DIR}/base-positive.txt" \
+            "${TEST_DIR}/upstream-positive.txt"
+          POSITIVE_STATUS=$?
+          set -e
+
+          [ "${POSITIVE_STATUS}" -eq 0 ]
+          grep -q 'line-a=LOCAL' "${TEST_DIR}/positive-result.txt"
+          grep -q 'line-c=UPSTREAM' "${TEST_DIR}/positive-result.txt"
+
+          # -------- 三方合并负向测试：同一区域双方不同修改必须冲突 --------
+          cat > "${TEST_DIR}/base-conflict.txt" <<'EOF'
+value=BASE
+EOF
+          cat > "${TEST_DIR}/local-conflict.txt" <<'EOF'
+value=LOCAL
+EOF
+          cat > "${TEST_DIR}/upstream-conflict.txt" <<'EOF'
+value=UPSTREAM
+EOF
+          cp "${TEST_DIR}/local-conflict.txt" "${TEST_DIR}/conflict-result.txt"
+
+          set +e
+          git merge-file \
+            --diff3 \
+            "${TEST_DIR}/conflict-result.txt" \
+            "${TEST_DIR}/base-conflict.txt" \
+            "${TEST_DIR}/upstream-conflict.txt"
+          CONFLICT_STATUS=$?
+          set -e
+
+          [ "${CONFLICT_STATUS}" -eq 1 ]
+          grep -q '^<<<<<<<' "${TEST_DIR}/conflict-result.txt"
+          grep -q '^>>>>>>>' "${TEST_DIR}/conflict-result.txt"
+
+          # -------- 普通文件策略验证：普通文件不允许静默冲突 --------
+          REPO_TEST="${TEST_DIR}/repo"
+          mkdir -p "${REPO_TEST}"
+          git -C "${REPO_TEST}" init -q
+          git -C "${REPO_TEST}" config user.name "test"
+          git -C "${REPO_TEST}" config user.email "test@example.com"
+          printf 'BASE\n' > "${REPO_TEST}/ordinary.txt"
+          git -C "${REPO_TEST}" add ordinary.txt
+          git -C "${REPO_TEST}" commit -qm base
+          git -C "${REPO_TEST}" branch upstream-test
+
+          printf 'LOCAL\n' > "${REPO_TEST}/ordinary.txt"
+          git -C "${REPO_TEST}" add ordinary.txt
+          git -C "${REPO_TEST}" commit -qm local
+
+          git -C "${REPO_TEST}" switch -q upstream-test
+          printf 'UPSTREAM\n' > "${REPO_TEST}/ordinary.txt"
+          git -C "${REPO_TEST}" add ordinary.txt
+          git -C "${REPO_TEST}" commit -qm upstream
+
+          git -C "${REPO_TEST}" switch -q -
+          set +e
+          git -C "${REPO_TEST}" merge --no-commit --no-ff upstream-test >/dev/null 2>&1
+          ORDINARY_STATUS=$?
+          set -e
+
+          [ "${ORDINARY_STATUS}" -ne 0 ]
+          git -C "${REPO_TEST}" diff --name-only --diff-filter=U | grep -qx 'ordinary.txt'
+          git -C "${REPO_TEST}" merge --abort
+
+          # 当前真实仓库整体 merge-tree 预检必须可计算。
+          git merge-tree --write-tree HEAD upstream/main >/dev/null 2>&1
+
+          echo "✅ 当前 main _worker.js 三方预演通过"
+          echo "✅ 本地 random-proxyip 功能保留"
+          echo "✅ 上游 ALPN / CertificateRequest / 版本更新保留"
+          echo "✅ 双方非重叠修改可自动合并"
+          echo "✅ 双方重叠修改会明确冲突"
+          echo "✅ 普通文件真实冲突会被识别"
+          echo "✅ TEST 模式没有 commit / push"
+
       - name: Check upstream status
+        if: env.MODE == 'sync'
         id: check
         run: |
           set -euo pipefail
-          echo "local main:    $(git rev-parse HEAD)"
-          echo "upstream main: $(git rev-parse upstream/main)"
-
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
             echo "当前 main 已包含上游最新提交，无需同步。"
@@ -82,15 +259,21 @@ jobs:
             echo "上游相对本地新增提交数: $(git rev-list --count HEAD..upstream/main)"
           fi
 
-      - name: Merge upstream then overlay local _worker.js
-        if: steps.check.outputs.up_to_date != 'true'
+      - name: Three-way sync and merge
+        if: env.MODE == 'sync' && steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
 
-          if [ ! -f scripts/overlay-local-worker.js ]; then
-            echo "::error::缺少 scripts/overlay-local-worker.js，拒绝同步以免丢掉本地功能。"
-            exit 1
-          fi
+          TEST_DIR=".sync-tmp"
+          rm -rf "${TEST_DIR}"
+          mkdir -p "${TEST_DIR}"
+          trap 'rm -rf "${TEST_DIR}"' EXIT
+
+          # 固化本次 _worker.js 的 LOCAL / BASE / UPSTREAM 三份输入。
+          WORKER_BASE_SHA="$(git merge-base HEAD upstream/main)"
+          git show "HEAD:_worker.js" > "${TEST_DIR}/worker-local.js"
+          git show "${WORKER_BASE_SHA}:_worker.js" > "${TEST_DIR}/worker-base.js"
+          git show "upstream/main:_worker.js" > "${TEST_DIR}/worker-upstream.js"
 
           set +e
           git merge --no-commit --no-ff --no-edit upstream/main
@@ -99,8 +282,9 @@ jobs:
 
           if [ "${MERGE_STATUS}" -ne 0 ]; then
             mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
+
             if [ "${#CONFLICTS[@]}" -eq 0 ]; then
-              echo "git merge 失败且没有冲突文件，停止。"
+              echo "::error::Git merge 失败，但没有可识别的冲突文件。"
               git merge --abort || true
               exit 1
             fi
@@ -108,62 +292,91 @@ jobs:
             OTHER=()
             for f in "${CONFLICTS[@]}"; do
               case "${f}" in
-                _worker.js|*/_worker.js) ;;
+                _worker.js) ;;
                 *) OTHER+=("${f}") ;;
               esac
             done
 
             if [ "${#OTHER[@]}" -gt 0 ]; then
-              echo "以下非 _worker.js 文件存在真实冲突，停止同步、不推送："
+              echo "::error::普通文件存在真实冲突，拒绝继续："
               printf '  - %s\n' "${OTHER[@]}"
               git merge --abort || true
               exit 1
             fi
 
-            echo "_worker.js 文本冲突是预期行为，将丢弃 Git 混合结果。"
-          else
-            echo "仓库级合并无冲突。仍然不信任 Git 对 _worker.js 的自动混合。"
+            echo "仅 _worker.js 存在 Git 冲突；转入独立三方合并。"
           fi
 
-          echo "以上游 _worker.js 为底，叠加本地功能..."
-          git show upstream/main:_worker.js > _worker.js
-          node scripts/overlay-local-worker.js _worker.js
+          # 不信任 Git 对 _worker.js 的自动结果，始终使用固定 LOCAL/BASE/UPSTREAM 做三方合并。
+          cp -- "${TEST_DIR}/worker-local.js" _worker.js
+
+          set +e
+          git merge-file \
+            --diff3 \
+            --marker-size=7 \
+            -L LOCAL \
+            -L BASE \
+            -L UPSTREAM \
+            _worker.js \
+            "${TEST_DIR}/worker-base.js" \
+            "${TEST_DIR}/worker-upstream.js"
+          WORKER_STATUS=$?
+          set -e
+
+          if [ "${WORKER_STATUS}" -eq 1 ]; then
+            echo "::error::_worker.js 存在真实重叠冲突，停止同步，不推送。"
+            git merge --abort || true
+            exit 1
+          fi
+
+          if [ "${WORKER_STATUS}" -ne 0 ]; then
+            echo "::error::_worker.js 三方合并异常，状态码=${WORKER_STATUS}。"
+            git merge --abort || true
+            exit "${WORKER_STATUS}"
+          fi
+
+          if grep -nE '^(<{7}|={7}|>{7})' _worker.js; then
+            echo "::error::_worker.js 结果仍含冲突标记，禁止推送。"
+            git merge --abort || true
+            exit 1
+          fi
+
           node --check _worker.js
-          git add -- _worker.js
+          git diff --check
 
-          # 避免 overlay 脚本本身在合并中被改乱
-          if git diff --name-only --diff-filter=U | grep -q 'overlay-local-worker.js'; then
-            git checkout --ours -- scripts/overlay-local-worker.js
-            git add -- scripts/overlay-local-worker.js
+          if ! grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js; then
+            echo "::error::本地 random-proxyip 功能丢失，禁止推送。"
+            git merge --abort || true
+            exit 1
           fi
+
+          git add -A
 
           if [ -f .git/MERGE_HEAD ]; then
-            git commit --no-edit -m "sync: merge cmliu/edgetunnel and overlay local _worker.js features"
+            git commit --no-edit -m "sync: merge cmliu/edgetunnel and preserve local _worker.js features"
           else
-            git commit -m "sync: overlay local _worker.js features onto upstream"
+            git commit -m "sync: merge cmliu/edgetunnel and preserve local _worker.js features"
           fi
 
-          echo "上游同步 + 本地功能叠加完成。"
-
-      - name: Validate merge result
-        if: steps.check.outputs.up_to_date != 'true'
+      - name: Validate sync result
+        if: env.MODE == 'sync' && steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
           if [ -n "$(git status --porcelain)" ]; then
-            echo "工作区不干净，禁止推送："
-            git status
+            echo "::error::同步后工作区不干净，禁止推送。"
+            git status --short
             exit 1
           fi
           if git ls-files -u | grep -q .; then
-            echo "仍存在未解决冲突，禁止推送。"
+            echo "::error::仍存在未解决冲突，禁止推送。"
             exit 1
           fi
           node --check _worker.js
           grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
-          echo "合并结果验证通过。"
+          echo "同步结果验证通过。"
 
       - name: Final safety check before push
-        if: steps.check.outputs.up_to_date != 'true'
+        if: env.MODE == 'sync' && steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
           git fetch --prune origin main
@@ -171,22 +384,27 @@ jobs:
           echo "本次同步基准 main: ${BASE_SHA}"
           echo "当前 origin/main:  ${CURRENT_ORIGIN}"
           if [ "${BASE_SHA}" != "${CURRENT_ORIGIN}" ]; then
-            echo "main 在合并期间发生变化，停止以免覆盖新提交。"
+            echo "::error::main 在合并期间发生变化，停止以免覆盖新提交。"
+            exit 1
+          fi
+          if git ls-files -u | grep -q .; then
+            echo "::error::仍存在未解决冲突，禁止推送。"
             exit 1
           fi
 
       - name: Push main
-        if: steps.check.outputs.up_to_date != 'true'
+        if: env.MODE == 'sync' && steps.check.outputs.up_to_date != 'true'
         run: |
           set -euo pipefail
           git push origin HEAD:main
-          echo "同步完成：main 已更新（_worker.js = 上游 + 本地多IP随机）。"
+          echo "✅ main 已安全同步。"
 
-      - name: Write job summary
+      - name: Job summary
         if: always()
         run: |
           {
             echo "## Upstream sync"
+            echo "- mode: \`${MODE}\`"
             echo "- conclusion: \`${{ job.status }}\`"
             echo "- HEAD: \`$(git rev-parse HEAD 2>/dev/null || echo n/a)\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -199,4 +417,6 @@ jobs:
           if-no-files-found: ignore
           path: |
             _worker.js
-            scripts/overlay-local-worker.js
+            .sync-tmp/
+            .sync-test/
+            .git/MERGE_HEAD
