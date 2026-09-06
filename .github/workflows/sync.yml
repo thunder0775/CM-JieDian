@@ -1,15 +1,16 @@
 name: Upstream Sync
 
-# 只同步到 main，不创建任何临时分支。
-# 无冲突：自动合并并推送到 main。
-# 有冲突：立即停止，不推送，不破坏现有 main。
+# 将 cmliu/edgetunnel/main 同步到本仓库 main。
+# 不创建任何远程临时分支，不强制覆盖 main。
+# 无冲突：自动合并并推送。
+# 有冲突或 main 在运行期间发生变化：停止，不推送。
 
 permissions:
   contents: write
 
 on:
   schedule:
-    # 每天 00:00 UTC 执行（北京时间/台北时间 08:00）
+    # 每天 00:00 UTC = 北京/台北时间 08:00
     - cron: "0 0 * * *"
   workflow_dispatch:
 
@@ -32,49 +33,105 @@ jobs:
 
       - name: Configure Git
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
+      - name: Fetch origin and upstream
         run: |
+          set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/cmliu/edgetunnel.git
+          git fetch --prune origin main
           git fetch --prune upstream main
 
-      - name: Check whether upstream has new commits
+      - name: Verify main has not changed during checkout
+        run: |
+          set -euo pipefail
+          LOCAL_MAIN="$(git rev-parse HEAD)"
+          REMOTE_MAIN="$(git rev-parse origin/main)"
+          echo "本次运行基准 main: ${LOCAL_MAIN}"
+          echo "当前 origin/main:   ${REMOTE_MAIN}"
+          if [ "${LOCAL_MAIN}" != "${REMOTE_MAIN}" ]; then
+            echo "检测到 main 在工作流启动期间发生变化。"
+            echo "为避免覆盖用户提交，本次同步停止，不推送。"
+            exit 1
+          fi
+
+      - name: Check upstream status
         id: check
         run: |
+          set -euo pipefail
+          LOCAL_MAIN="$(git rev-parse HEAD)"
+          UPSTREAM_MAIN="$(git rev-parse upstream/main)"
+          echo "local main:    ${LOCAL_MAIN}"
+          echo "upstream main: ${UPSTREAM_MAIN}"
+
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
             echo "当前 main 已包含上游最新提交，无需同步。"
           else
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
-            echo "检测到上游存在新提交，开始合并。"
+            echo "检测到上游存在新提交。"
+            echo "上游相对本地新增提交数: $(git rev-list --count HEAD..upstream/main)"
           fi
 
       - name: Merge upstream into main
         if: steps.check.outputs.up_to_date != 'true'
         run: |
-          set -e
+          set -euo pipefail
+          echo "开始合并 cmliu/edgetunnel/main -> main"
 
-          echo "当前 main:    $(git rev-parse HEAD)"
-          echo "上游 main:    $(git rev-parse upstream/main)"
-
-          if git merge --no-edit upstream/main; then
-            echo "上游更新已成功合并到 main。"
+          if git merge --no-edit --no-ff upstream/main; then
+            echo "上游更新已成功合并。"
           else
             echo ""
             echo "========================================"
-            echo "上游同步发生冲突。"
-            echo "不会推送任何内容，现有 main 保持不变。"
-            echo "请手动解决冲突后再次运行本工作流。"
+            echo "上游同步发生真实 Git 冲突。"
+            echo "不会推送冲突状态。"
+            echo "现有远程 main 保持不变。"
             echo "========================================"
+            git diff --name-only --diff-filter=U || true
             git merge --abort || true
+            exit 1
+          fi
+
+      - name: Validate merge result
+        if: steps.check.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          echo "检查 Git 工作区..."
+          if [ -n "$(git status --porcelain)" ]; then
+            git diff --check
+          fi
+          if git diff --name-only HEAD^ HEAD | grep -Eq '(^|/)_worker\.js$'; then
+            echo "检测到 _worker.js 发生变化，执行 Node 语法检查。"
+            node --check _worker.js
+          fi
+          echo "合并结果验证通过。"
+
+      - name: Final safety check before push
+        if: steps.check.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          git fetch --prune origin main
+          BASE_BEFORE_MERGE="$(git rev-parse HEAD^1)"
+          CURRENT_ORIGIN="$(git rev-parse origin/main)"
+          echo "合并前 main 基准: ${BASE_BEFORE_MERGE}"
+          echo "当前 origin/main:  ${CURRENT_ORIGIN}"
+          if [ "${BASE_BEFORE_MERGE}" != "${CURRENT_ORIGIN}" ]; then
+            echo "main 在合并期间发生变化。"
+            echo "为避免覆盖新提交，本次同步停止，不推送。"
+            exit 1
+          fi
+          if git ls-files -u | grep -q .; then
+            echo "仍存在未解决冲突，禁止推送。"
             exit 1
           fi
 
       - name: Push main
         if: steps.check.outputs.up_to_date != 'true'
         run: |
-          git push origin main
+          set -euo pipefail
+          git push origin HEAD:main
           echo "同步完成：CM-JieDian/main 已更新。"
