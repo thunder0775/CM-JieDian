@@ -59,6 +59,7 @@ jobs:
           mkdir -p "$T"
           trap 'rm -rf "$T"' EXIT
           BASE="$(git merge-base HEAD upstream/main)"
+
           git show HEAD:_worker.js > "$T/local.js"
           git show "$BASE:_worker.js" > "$T/base.js"
           git show upstream/main:_worker.js > "$T/upstream.js"
@@ -74,35 +75,17 @@ jobs:
           grep -q "查询反代IP = searchParams.get('proxyip')" "$T/result.js"
           grep -q '路径反代值 = 随机抽取IP' "$T/result.js"
 
-          cat > "$T/base" <<'EOF'
-a=BASE
-b=BASE
-c=BASE
-EOF
-          cat > "$T/local" <<'EOF'
-a=LOCAL
-b=BASE
-c=BASE
-EOF
-          cat > "$T/upstream" <<'EOF'
-a=BASE
-b=BASE
-c=UPSTREAM
-EOF
+          printf 'a=BASE\nb=BASE\nc=BASE\n' > "$T/base"
+          printf 'a=LOCAL\nb=BASE\nc=BASE\n' > "$T/local"
+          printf 'a=BASE\nb=BASE\nc=UPSTREAM\n' > "$T/upstream"
           cp "$T/local" "$T/positive"
           git merge-file "$T/positive" "$T/base" "$T/upstream"
           grep -q 'a=LOCAL' "$T/positive"
           grep -q 'c=UPSTREAM' "$T/positive"
 
-          cat > "$T/base-conflict" <<'EOF'
-value=BASE
-EOF
-          cat > "$T/local-conflict" <<'EOF'
-value=LOCAL
-EOF
-          cat > "$T/upstream-conflict" <<'EOF'
-value=UPSTREAM
-EOF
+          printf 'value=BASE\n' > "$T/base-conflict"
+          printf 'value=LOCAL\n' > "$T/local-conflict"
+          printf 'value=UPSTREAM\n' > "$T/upstream-conflict"
           cp "$T/local-conflict" "$T/conflict"
           set +e
           git merge-file --diff3 "$T/conflict" "$T/base-conflict" "$T/upstream-conflict"
@@ -111,6 +94,10 @@ EOF
           test "$S" -eq 1
           grep -q '^<<<<<<<' "$T/conflict"
           grep -q '^>>>>>>>' "$T/conflict"
+
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
 
       - name: Check upstream status
         id: upstream
@@ -131,12 +118,14 @@ EOF
           set -euo pipefail
           T=.sync-tmp
           rm -rf "$T"
-          mkdir -p "$T"
+          mkdir -p "$T/local-workflows"
           trap 'rm -rf "$T"' EXIT
+
           WORKER_BASE="$(git merge-base HEAD upstream/main)"
           git show HEAD:_worker.js > "$T/local.js"
           git show "$WORKER_BASE:_worker.js" > "$T/base.js"
           git show upstream/main:_worker.js > "$T/upstream.js"
+          cp -a .github/workflows/. "$T/local-workflows/"
 
           set +e
           git merge --no-commit --no-ff --no-edit upstream/main
@@ -145,16 +134,36 @@ EOF
 
           if [ "$MERGE_STATUS" -ne 0 ]; then
             mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
-            OTHER=()
-            for f in "${CONFLICTS[@]}"; do
-              [ "$f" = '_worker.js' ] || OTHER+=("$f")
-            done
-            if [ "${#OTHER[@]}" -gt 0 ] || [ "${#CONFLICTS[@]}" -eq 0 ]; then
+            if [ "${#CONFLICTS[@]}" -eq 0 ]; then
               git merge --abort || true
-              printf '冲突文件: %s\n' "${CONFLICTS[*]:-无}"
+              echo 'merge failed without a conflict set'
               exit 1
             fi
+            for f in "${CONFLICTS[@]}"; do
+              case "$f" in
+                .github/workflows/*|_worker.js) ;;
+                *)
+                  git merge --abort || true
+                  echo "non-protected conflict: $f"
+                  exit 1
+                  ;;
+              esac
+            done
           fi
+
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp -a "$T/local-workflows/." .github/workflows/
+          git add -A .github/workflows
+
+          mapfile -t REMAINING < <(git diff --name-only --diff-filter=U || true)
+          for f in "${REMAINING[@]}"; do
+            [ "$f" = '_worker.js' ] || {
+              git merge --abort || true
+              echo "unresolved conflict outside _worker.js: $f"
+              exit 1
+            }
+          done
 
           cp "$T/local.js" _worker.js
           set +e
@@ -163,6 +172,7 @@ EOF
           set -e
           if [ "$WORKER_STATUS" -ne 0 ]; then
             git merge --abort || true
+            echo 'real _worker.js three-way conflict detected; sync stopped'
             exit "$WORKER_STATUS"
           fi
 
@@ -172,6 +182,9 @@ EOF
           grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
           grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
           grep -q '路径反代值 = 随机抽取IP' _worker.js
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
 
           git add -A
           if git diff --cached --quiet; then
@@ -180,9 +193,9 @@ EOF
           fi
 
           if [ -f .git/MERGE_HEAD ]; then
-            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local _worker.js features'
+            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
           else
-            git commit -m 'sync: merge cmliu/edgetunnel and preserve local _worker.js features'
+            git commit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
           fi
 
       - name: Final validation
@@ -196,6 +209,9 @@ EOF
           grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
           grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
           grep -q '路径反代值 = 随机抽取IP' _worker.js
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
           git diff --check HEAD^ HEAD
 
       - name: Final race check
