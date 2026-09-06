@@ -1,23 +1,8 @@
 name: Upstream Sync
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/sync.yml
   schedule:
     - cron: '0 0 * * *'
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'test=只读验证，sync=正式同步'
-        required: false
-        default: test
-        type: choice
-        options:
-          - test
-          - sync
 
 permissions:
   contents: write
@@ -26,23 +11,17 @@ concurrency:
   group: upstream-sync-main
   cancel-in-progress: false
 
+env:
+  MODE: sync
+
 jobs:
   sync:
     name: Sync cmliu/edgetunnel -> main
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      MODE: ${{ inputs.mode || 'sync' }}
 
     steps:
-      - name: Push event guard
-        if: ${{ github.event_name == 'push' }}
-        run: |
-          echo '检测到 push 事件。仅执行兼容性保护，不执行同步。'
-          exit 0
-
       - name: Checkout main
-        if: ${{ github.event_name != 'push' }}
         uses: actions/checkout@v4
         with:
           ref: main
@@ -50,7 +29,6 @@ jobs:
           persist-credentials: true
 
       - name: Configure Git and fetch remotes
-        if: ${{ github.event_name != 'push' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -64,7 +42,6 @@ jobs:
           git fetch --prune upstream main
 
       - name: Lock main baseline
-        if: ${{ github.event_name != 'push' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -72,13 +49,8 @@ jobs:
           ORIGIN_SHA="$(git rev-parse origin/main)"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
           test "${BASE_SHA}" = "${ORIGIN_SHA}"
-          case "${MODE}" in
-            test|sync) ;;
-            *) echo "::error::非法 MODE=${MODE}"; exit 1 ;;
-          esac
 
-      - name: Test three-way merge policy
-        if: ${{ github.event_name != 'push' && env.MODE == 'test' }}
+      - name: Verify three-way merge policy
         shell: bash
         run: |
           set -euo pipefail
@@ -101,6 +73,7 @@ jobs:
           grep -q 'LOCAL-CUSTOM: random-proxyip' "$T/result.js"
           grep -q "查询反代IP = searchParams.get('proxyip')" "$T/result.js"
           grep -q '路径反代值 = 随机抽取IP' "$T/result.js"
+
           cat > "$T/base" <<'EOF'
 a=BASE
 b=BASE
@@ -120,6 +93,7 @@ EOF
           git merge-file "$T/positive" "$T/base" "$T/upstream"
           grep -q 'a=LOCAL' "$T/positive"
           grep -q 'c=UPSTREAM' "$T/positive"
+
           cat > "$T/base-conflict" <<'EOF'
 value=BASE
 EOF
@@ -140,7 +114,6 @@ EOF
           echo 'TEST OK'
 
       - name: Check upstream status
-        if: ${{ github.event_name != 'push' && env.MODE == 'sync' }}
         id: upstream
         shell: bash
         run: |
@@ -153,7 +126,7 @@ EOF
           fi
 
       - name: Strict sync
-        if: ${{ github.event_name != 'push' && env.MODE == 'sync' && steps.upstream.outputs.up_to_date != 'true' }}
+        if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -165,20 +138,25 @@ EOF
           git show HEAD:_worker.js > "$T/local.js"
           git show "$WORKER_BASE:_worker.js" > "$T/base.js"
           git show upstream/main:_worker.js > "$T/upstream.js"
+
           set +e
           git merge --no-commit --no-ff --no-edit upstream/main
           MERGE_STATUS=$?
           set -e
+
           if [ "$MERGE_STATUS" -ne 0 ]; then
             mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
             OTHER=()
-            for f in "${CONFLICTS[@]}"; do [ "$f" = '_worker.js' ] || OTHER+=("$f"); done
+            for f in "${CONFLICTS[@]}"; do
+              [ "$f" = '_worker.js' ] || OTHER+=("$f")
+            done
             if [ "${#OTHER[@]}" -gt 0 ] || [ "${#CONFLICTS[@]}" -eq 0 ]; then
               git merge --abort || true
               printf '冲突文件: %s\n' "${CONFLICTS[*]:-无}"
               exit 1
             fi
           fi
+
           cp "$T/local.js" _worker.js
           set +e
           git merge-file --diff3 --marker-size=7 _worker.js "$T/base.js" "$T/upstream.js"
@@ -188,17 +166,20 @@ EOF
             git merge --abort || true
             exit "$WORKER_STATUS"
           fi
+
           ! grep -qE '^(<{7}|={7}|>{7})' _worker.js
           node --check _worker.js
           git diff --check
           grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
           grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
           grep -q '路径反代值 = 随机抽取IP' _worker.js
+
           git add -A
           if git diff --cached --quiet; then
             [ ! -f .git/MERGE_HEAD ] || git merge --abort
             exit 0
           fi
+
           if [ -f .git/MERGE_HEAD ]; then
             git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local _worker.js features'
           else
@@ -206,7 +187,7 @@ EOF
           fi
 
       - name: Final validation
-        if: ${{ github.event_name != 'push' && env.MODE == 'sync' && steps.upstream.outputs.up_to_date != 'true' }}
+        if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -219,7 +200,7 @@ EOF
           git diff --check HEAD^ HEAD
 
       - name: Final race check
-        if: ${{ github.event_name != 'push' && env.MODE == 'sync' && steps.upstream.outputs.up_to_date != 'true' }}
+        if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -228,6 +209,6 @@ EOF
           test "$(git rev-parse HEAD^)" = "$BASE_SHA"
 
       - name: Push main
-        if: ${{ github.event_name != 'push' && env.MODE == 'sync' && steps.upstream.outputs.up_to_date != 'true' }}
+        if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: git push origin HEAD:main
