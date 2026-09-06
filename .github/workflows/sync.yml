@@ -1,13 +1,22 @@
 name: Upstream Sync
 
 on:
+  # GitHub Actions 目前存在已知异常：仅有 workflow_dispatch 的工作流
+  # 可能被错误地按 push 事件调度，导致 startup failure / 0 jobs。
+  # 显式声明 push 后，把 push 安全地限制为“仅观察，不执行同步”，
+  # 避免该异常再次把整个 Workflow 卡死，也避免意外同步。
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/sync.yml
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       mode:
         description: 'test=只读验证，sync=正式同步'
-        required: true
+        required: false
         default: test
         type: choice
         options:
@@ -24,6 +33,9 @@ concurrency:
 jobs:
   sync:
     name: Sync cmliu/edgetunnel -> main
+    # push 事件只用于吸收 GitHub 对 workflow_dispatch 类工作流的错误触发；
+    # 真正同步只允许 schedule / workflow_dispatch 执行。
+    if: ${{ github.event_name != 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
