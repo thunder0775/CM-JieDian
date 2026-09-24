@@ -203,16 +203,41 @@ jobs:
         if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: |
-          set -euo pipefail
-          test -z "$(git status --porcelain)"
+          set -uo pipefail
+
+          echo "=== 1. Git status ==="
+          git status --short
+          test -z "$(git status --porcelain)" || {
+            echo "::error::Git working tree is not clean"
+            git status --short
+            exit 1
+          }
+
+          echo "=== 2. Node syntax ==="
           node --check _worker.js
-          ! grep -qE '^(<{7}|={7}|>{7})' _worker.js
-          grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
-          grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
-          grep -q '路径反代值 = 随机抽取IP' _worker.js
+
+          echo "=== 3. Conflict markers ==="
+          if grep -qE '^(<{7}|={7}|>{7})' _worker.js; then
+            echo "::error::Conflict markers found in _worker.js"
+            grep -nE '^(<{7}|={7}|>{7})' _worker.js
+            exit 1
+          fi
+
+          echo "=== 4. Local custom marker ==="
+          grep -n 'LOCAL-CUSTOM: random-proxyip' _worker.js
+
+          echo "=== 5. proxyip ==="
+          grep -n "查询反代IP = searchParams.get('proxyip')" _worker.js
+
+          echo "=== 6. random proxy ==="
+          grep -n '路径反代值 = 随机抽取IP' _worker.js
+
+          echo "=== 7. Workflow files ==="
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
           test ! -f .github/workflows/sync.yml
+
+          echo "=== FINAL VALIDATION OK ==="
 
       - name: Final race check
         if: steps.upstream.outputs.up_to_date != 'true'
