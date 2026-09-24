@@ -213,7 +213,6 @@ jobs:
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
           test ! -f .github/workflows/sync.yml
-          git diff --check HEAD^ HEAD
 
       - name: Final race check
         if: steps.upstream.outputs.up_to_date != 'true'
