@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          T=.sync-test
+          T="${RUNNER_TEMP}/sync-test"
           rm -rf "$T"
           mkdir -p "$T"
           trap 'rm -rf "$T"' EXIT
@@ -117,7 +117,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          T=.sync-tmp
+          T="${RUNNER_TEMP}/sync-tmp"
           rm -rf "$T"
           mkdir -p "$T/local-workflows"
           trap 'rm -rf "$T"' EXIT
@@ -206,7 +206,6 @@ jobs:
           set -uo pipefail
 
           echo "=== 1. Git status ==="
-          rm -rf .sync-tmp .sync-test
           git status --short
           test -z "$(git status --porcelain)" || {
             echo "::error::Git working tree is not clean"
