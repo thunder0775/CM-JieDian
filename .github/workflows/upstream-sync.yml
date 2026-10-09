@@ -12,9 +12,6 @@ concurrency:
   group: upstream-sync-main
   cancel-in-progress: false
 
-env:
-  MODE: sync
-
 jobs:
   sync:
     name: Sync cmliu/edgetunnel -> main
@@ -49,56 +46,58 @@ jobs:
           BASE_SHA="$(git rev-parse HEAD)"
           ORIGIN_SHA="$(git rev-parse origin/main)"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
-          test "${BASE_SHA}" = "${ORIGIN_SHA}"
+          test "${BASE_SHA}" = "${ORIGIN_SHA}" || {
+            echo "::error::main 已发生变化，拒绝基于过期版本同步"
+            exit 1
+          }
 
-      - name: Verify three-way merge policy
+      - name: Preflight syntax, policy and merge tests
         shell: bash
         run: |
           set -euo pipefail
-          T="${RUNNER_TEMP}/sync-test"
+          T="${RUNNER_TEMP}/sync-preflight"
           rm -rf "$T"
           mkdir -p "$T"
           trap 'rm -rf "$T"' EXIT
-          BASE="$(git merge-base HEAD upstream/main)"
 
+          # 验证现有 Worker 语法与本地关键功能基线。
           git show HEAD:_worker.js > "$T/local.js"
-          git show "$BASE:_worker.js" > "$T/base.js"
-          git show upstream/main:_worker.js > "$T/upstream.js"
-          cp "$T/local.js" "$T/result.js"
-          set +e
-          git merge-file --diff3 --marker-size=7 "$T/result.js" "$T/base.js" "$T/upstream.js"
-          S=$?
-          set -e
-          test "$S" -eq 0
-          ! grep -qE '^(<{7}|={7}|>{7})' "$T/result.js"
-          node --check "$T/result.js"
-          grep -q 'LOCAL-CUSTOM: random-proxyip' "$T/result.js"
-          grep -q "查询反代IP = searchParams.get('proxyip')" "$T/result.js"
-          grep -q '路径反代值 = 随机抽取IP' "$T/result.js"
+          node --check "$T/local.js"
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' "$T/local.js"
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" "$T/local.js"
+          grep -Fq '路径反代值 = 随机抽取IP' "$T/local.js"
+          grep -Fq 'const uuidRegex' "$T/local.js"
+          grep -Fq '管理员密码' "$T/local.js"
+          grep -Fq 'async function 处理WS请求' "$T/local.js"
+          grep -Fq 'function MD5MD5' "$T/local.js"
 
+          # 确认本地工作流保护策略与备份文件存在。
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
+          test ! -f .github/workflows/sync.yml
+
+          # 测试：不重叠修改必须自动合并。
           printf 'a=BASE\nb=BASE\nc=BASE\n' > "$T/base"
           printf 'a=LOCAL\nb=BASE\nc=BASE\n' > "$T/local"
           printf 'a=BASE\nb=BASE\nc=UPSTREAM\n' > "$T/upstream"
           cp "$T/local" "$T/positive"
           git merge-file "$T/positive" "$T/base" "$T/upstream"
-          grep -q 'a=LOCAL' "$T/positive"
-          grep -q 'c=UPSTREAM' "$T/positive"
+          grep -Fq 'a=LOCAL' "$T/positive"
+          grep -Fq 'c=UPSTREAM' "$T/positive"
 
+          # 测试：真正的同一行冲突必须被识别并阻止。
           printf 'value=BASE\n' > "$T/base-conflict"
           printf 'value=LOCAL\n' > "$T/local-conflict"
           printf 'value=UPSTREAM\n' > "$T/upstream-conflict"
           cp "$T/local-conflict" "$T/conflict"
           set +e
           git merge-file --diff3 "$T/conflict" "$T/base-conflict" "$T/upstream-conflict"
-          S=$?
+          STATUS=$?
           set -e
-          test "$S" -eq 1
+          test "$STATUS" -eq 1
           grep -q '^<<<<<<<' "$T/conflict"
           grep -q '^>>>>>>>' "$T/conflict"
-
-          test -f .github/workflows/upstream-sync.yml
-          test -f .github/workflows/Auto-close-empty-PRs.yml
-          test ! -f .github/workflows/sync.yml
 
       - name: Check upstream status
         id: upstream
@@ -107,16 +106,19 @@ jobs:
           set -euo pipefail
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo 'up_to_date=true' >> "$GITHUB_OUTPUT"
+            echo '上游没有新提交，无需同步。'
           else
             echo 'up_to_date=false' >> "$GITHUB_OUTPUT"
             echo "发现 $(git rev-list --count HEAD..upstream/main) 个上游新提交。"
           fi
 
       - name: Strict sync
+        id: sync
         if: steps.upstream.outputs.up_to_date != 'true'
         shell: bash
         run: |
           set -euo pipefail
+          echo 'changed=false' >> "$GITHUB_OUTPUT"
           T="${RUNNER_TEMP}/sync-tmp"
           rm -rf "$T"
           mkdir -p "$T/local-workflows"
@@ -128,6 +130,7 @@ jobs:
           git show upstream/main:_worker.js > "$T/upstream.js"
           cp -a .github/workflows/. "$T/local-workflows/"
 
+          # 合并上游；冲突文件逐个处理，普通文件以上游版本为准。
           set +e
           git merge --no-commit --no-ff --no-edit upstream/main
           MERGE_STATUS=$?
@@ -137,33 +140,43 @@ jobs:
             mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
             if [ "${#CONFLICTS[@]}" -eq 0 ]; then
               git merge --abort || true
-              echo 'merge failed without a conflict set'
+              echo "::error::合并失败，但没有可处理的冲突文件"
               exit 1
             fi
+
             for f in "${CONFLICTS[@]}"; do
               case "$f" in
-                .github/workflows/*|_worker.js) ;;
+                .github/workflows/*|_worker.js)
+                  # 工作流目录和 _worker.js 由专门逻辑处理。
+                  ;;
                 *)
-                  git merge --abort || true
-                  echo "non-protected conflict: $f"
-                  exit 1
+                  echo "普通文件冲突，采用上游版本：$f"
+                  if git cat-file -e "upstream/main:$f" 2>/dev/null; then
+                    git checkout --theirs -- "$f"
+                    git add -- "$f"
+                  else
+                    # 上游已删除该文件，按上游结果删除。
+                    git rm -f -- "$f" 2>/dev/null || true
+                  fi
                   ;;
               esac
             done
           fi
 
+          # 无条件恢复整个本地工作流目录，保护本地新增、修改、删除策略。
           rm -rf .github/workflows
           mkdir -p .github/workflows
           cp -a "$T/local-workflows/." .github/workflows/
           git add -A .github/workflows
 
+          # _worker.js 使用三方合并；真实冲突立即停止。
           mapfile -t REMAINING < <(git diff --name-only --diff-filter=U || true)
           for f in "${REMAINING[@]}"; do
-            [ "$f" = '_worker.js' ] || {
+            if [ "$f" != '_worker.js' ]; then
               git merge --abort || true
-              echo "unresolved conflict outside _worker.js: $f"
+              echo "::error::发现未处理冲突：$f"
               exit 1
-            }
+            fi
           done
 
           cp "$T/local.js" _worker.js
@@ -173,82 +186,93 @@ jobs:
           set -e
           if [ "$WORKER_STATUS" -ne 0 ]; then
             git merge --abort || true
-            echo 'real _worker.js three-way conflict detected; sync stopped'
+            echo "::error::_worker.js 存在真实三方合并冲突，已停止同步"
             exit "$WORKER_STATUS"
           fi
 
-          ! grep -qE '^(<{7}|={7}|>{7})' _worker.js
+          # 合并后的功能完整性、安全基线和语法检查。
           node --check _worker.js
           git diff --check
-          grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
-          grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
-          grep -q '路径反代值 = 随机抽取IP' _worker.js
+          if grep -nE '^(<{7}|>{7})' _worker.js; then
+            echo "::error::_worker.js 存在冲突标记"
+            exit 1
+          fi
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' _worker.js
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" _worker.js
+          grep -Fq '路径反代值 = 随机抽取IP' _worker.js
+          grep -Fq 'const uuidRegex' _worker.js
+          grep -Fq '管理员密码' _worker.js
+          grep -Fq 'async function 处理WS请求' _worker.js
+          grep -Fq 'function MD5MD5' _worker.js
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
           test ! -f .github/workflows/sync.yml
 
           git add -A
           if git diff --cached --quiet; then
             [ ! -f .git/MERGE_HEAD ] || git merge --abort
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo '没有文件内容变化，无需创建空提交。'
             exit 0
           fi
 
           if [ -f .git/MERGE_HEAD ]; then
-            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
+            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local customizations'
           else
-            git commit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
+            git commit -m 'sync: merge cmliu/edgetunnel and preserve local customizations'
           fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
 
       - name: Final validation
-        if: steps.upstream.outputs.up_to_date != 'true'
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          echo "=== 1. Git status ==="
+          echo '=== 1. 工作区状态 ==='
           git status --short
           test -z "$(git status --porcelain)" || {
-            echo "::error::Git working tree is not clean"
-            git status --short
+            echo "::error::工作区不干净，拒绝推送"
             exit 1
           }
 
-          echo "=== 2. Node syntax ==="
+          echo '=== 2. Worker 语法 ==='
           node --check _worker.js
 
-          echo "=== 3. Conflict markers ==="
-          if grep -qE '^(<{7}|={7}|>{7})' _worker.js; then
-            echo "::error::Conflict markers found in _worker.js"
-            grep -nE '^(<{7}|={7}|>{7})' _worker.js
-            exit 1
-          fi
+          echo '=== 3. 定制功能与安全基线 ==='
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' _worker.js
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" _worker.js
+          grep -Fq '路径反代值 = 随机抽取IP' _worker.js
+          grep -Fq 'const uuidRegex' _worker.js
+          grep -Fq '管理员密码' _worker.js
+          grep -Fq 'async function 处理WS请求' _worker.js
+          grep -Fq 'function MD5MD5' _worker.js
 
-          echo "=== 4. Local custom marker ==="
-          grep -n 'LOCAL-CUSTOM: random-proxyip' _worker.js
-
-          echo "=== 5. proxyip ==="
-          grep -n "查询反代IP = searchParams.get('proxyip')" _worker.js
-
-          echo "=== 6. random proxy ==="
-          grep -n '路径反代值 = 随机抽取IP' _worker.js
-
-          echo "=== 7. Workflow files ==="
+          echo '=== 4. 工作流保护 ==='
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
           test ! -f .github/workflows/sync.yml
 
-          echo "=== FINAL VALIDATION OK ==="
+          echo '=== FINAL VALIDATION OK ==='
 
       - name: Final race check
-        if: steps.upstream.outputs.up_to_date != 'true'
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
           git fetch --prune origin main
-          test "$(git rev-parse origin/main)" = "$BASE_SHA"
-          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "::error::同步期间 main 已被其他提交更新，拒绝推送"
+            exit 1
+          }
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA" || {
+            echo "::error::提交父节点与锁定基线不一致，拒绝推送"
+            exit 1
+          }
 
       - name: Push main
-        if: steps.upstream.outputs.up_to_date != 'true'
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         run: git push origin HEAD:main
