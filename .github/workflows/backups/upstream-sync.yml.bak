@@ -1,0 +1,254 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+env:
+  MODE: sync
+
+jobs:
+  sync:
+    name: Sync cmliu/edgetunnel -> main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure Git and fetch remotes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/cmliu/edgetunnel.git
+          git fetch --prune origin main
+          git fetch --prune upstream main
+
+      - name: Lock main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git rev-parse HEAD)"
+          ORIGIN_SHA="$(git rev-parse origin/main)"
+          echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+          test "${BASE_SHA}" = "${ORIGIN_SHA}"
+
+      - name: Verify three-way merge policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${RUNNER_TEMP}/sync-test"
+          rm -rf "$T"
+          mkdir -p "$T"
+          trap 'rm -rf "$T"' EXIT
+          BASE="$(git merge-base HEAD upstream/main)"
+
+          git show HEAD:_worker.js > "$T/local.js"
+          git show "$BASE:_worker.js" > "$T/base.js"
+          git show upstream/main:_worker.js > "$T/upstream.js"
+          cp "$T/local.js" "$T/result.js"
+          set +e
+          git merge-file --diff3 --marker-size=7 "$T/result.js" "$T/base.js" "$T/upstream.js"
+          S=$?
+          set -e
+          test "$S" -eq 0
+          ! grep -qE '^(<{7}|={7}|>{7})' "$T/result.js"
+          node --check "$T/result.js"
+          grep -q 'LOCAL-CUSTOM: random-proxyip' "$T/result.js"
+          grep -q "查询反代IP = searchParams.get('proxyip')" "$T/result.js"
+          grep -q '路径反代值 = 随机抽取IP' "$T/result.js"
+
+          printf 'a=BASE\nb=BASE\nc=BASE\n' > "$T/base"
+          printf 'a=LOCAL\nb=BASE\nc=BASE\n' > "$T/local"
+          printf 'a=BASE\nb=BASE\nc=UPSTREAM\n' > "$T/upstream"
+          cp "$T/local" "$T/positive"
+          git merge-file "$T/positive" "$T/base" "$T/upstream"
+          grep -q 'a=LOCAL' "$T/positive"
+          grep -q 'c=UPSTREAM' "$T/positive"
+
+          printf 'value=BASE\n' > "$T/base-conflict"
+          printf 'value=LOCAL\n' > "$T/local-conflict"
+          printf 'value=UPSTREAM\n' > "$T/upstream-conflict"
+          cp "$T/local-conflict" "$T/conflict"
+          set +e
+          git merge-file --diff3 "$T/conflict" "$T/base-conflict" "$T/upstream-conflict"
+          S=$?
+          set -e
+          test "$S" -eq 1
+          grep -q '^<<<<<<<' "$T/conflict"
+          grep -q '^>>>>>>>' "$T/conflict"
+
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
+
+      - name: Check upstream status
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'up_to_date=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'up_to_date=false' >> "$GITHUB_OUTPUT"
+            echo "发现 $(git rev-list --count HEAD..upstream/main) 个上游新提交。"
+          fi
+
+      - name: Strict sync
+        if: steps.upstream.outputs.up_to_date != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${RUNNER_TEMP}/sync-tmp"
+          rm -rf "$T"
+          mkdir -p "$T/local-workflows"
+          trap 'rm -rf "$T"' EXIT
+
+          WORKER_BASE="$(git merge-base HEAD upstream/main)"
+          git show HEAD:_worker.js > "$T/local.js"
+          git show "$WORKER_BASE:_worker.js" > "$T/base.js"
+          git show upstream/main:_worker.js > "$T/upstream.js"
+          cp -a .github/workflows/. "$T/local-workflows/"
+
+          set +e
+          git merge --no-commit --no-ff --no-edit upstream/main
+          MERGE_STATUS=$?
+          set -e
+
+          if [ "$MERGE_STATUS" -ne 0 ]; then
+            mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
+            if [ "${#CONFLICTS[@]}" -eq 0 ]; then
+              git merge --abort || true
+              echo 'merge failed without a conflict set'
+              exit 1
+            fi
+            for f in "${CONFLICTS[@]}"; do
+              case "$f" in
+                .github/workflows/*|_worker.js) ;;
+                *)
+                  git merge --abort || true
+                  echo "non-protected conflict: $f"
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp -a "$T/local-workflows/." .github/workflows/
+          git add -A .github/workflows
+
+          mapfile -t REMAINING < <(git diff --name-only --diff-filter=U || true)
+          for f in "${REMAINING[@]}"; do
+            [ "$f" = '_worker.js' ] || {
+              git merge --abort || true
+              echo "unresolved conflict outside _worker.js: $f"
+              exit 1
+            }
+          done
+
+          cp "$T/local.js" _worker.js
+          set +e
+          git merge-file --diff3 --marker-size=7 _worker.js "$T/base.js" "$T/upstream.js"
+          WORKER_STATUS=$?
+          set -e
+          if [ "$WORKER_STATUS" -ne 0 ]; then
+            git merge --abort || true
+            echo 'real _worker.js three-way conflict detected; sync stopped'
+            exit "$WORKER_STATUS"
+          fi
+
+          ! grep -qE '^(<{7}|={7}|>{7})' _worker.js
+          node --check _worker.js
+          git diff --check
+          grep -q 'LOCAL-CUSTOM: random-proxyip' _worker.js
+          grep -q "查询反代IP = searchParams.get('proxyip')" _worker.js
+          grep -q '路径反代值 = 随机抽取IP' _worker.js
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
+
+          git add -A
+          if git diff --cached --quiet; then
+            [ ! -f .git/MERGE_HEAD ] || git merge --abort
+            exit 0
+          fi
+
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
+          else
+            git commit -m 'sync: merge cmliu/edgetunnel and preserve local protected files'
+          fi
+
+      - name: Final validation
+        if: steps.upstream.outputs.up_to_date != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "=== 1. Git status ==="
+          git status --short
+          test -z "$(git status --porcelain)" || {
+            echo "::error::Git working tree is not clean"
+            git status --short
+            exit 1
+          }
+
+          echo "=== 2. Node syntax ==="
+          node --check _worker.js
+
+          echo "=== 3. Conflict markers ==="
+          if grep -qE '^(<{7}|={7}|>{7})' _worker.js; then
+            echo "::error::Conflict markers found in _worker.js"
+            grep -nE '^(<{7}|={7}|>{7})' _worker.js
+            exit 1
+          fi
+
+          echo "=== 4. Local custom marker ==="
+          grep -n 'LOCAL-CUSTOM: random-proxyip' _worker.js
+
+          echo "=== 5. proxyip ==="
+          grep -n "查询反代IP = searchParams.get('proxyip')" _worker.js
+
+          echo "=== 6. random proxy ==="
+          grep -n '路径反代值 = 随机抽取IP' _worker.js
+
+          echo "=== 7. Workflow files ==="
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test ! -f .github/workflows/sync.yml
+
+          echo "=== FINAL VALIDATION OK ==="
+
+      - name: Final race check
+        if: steps.upstream.outputs.up_to_date != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --prune origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+
+      - name: Push main
+        if: steps.upstream.outputs.up_to_date != 'true'
+        shell: bash
+        run: git push origin HEAD:main
