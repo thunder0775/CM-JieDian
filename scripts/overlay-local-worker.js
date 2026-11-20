@@ -3,7 +3,9 @@
 
 /**
  * 把本仓库的本地功能叠到上游 _worker.js 上。
- * 当前本地功能：proxyip / 路径反代 支持逗号分隔多 IP，运行时随机抽一个。
+ * 当前本地功能：
+ *   1. proxyip / 路径反代 支持逗号分隔多 IP，运行时随机抽一个。
+ *   2. connectDirect 的第四个参数从 true 改为 false（本地定制）。
  *
  * 用法: node scripts/overlay-local-worker.js [_worker.js]
  * 可重复执行：已叠加则跳过。锚点找不到则失败，避免静默丢掉功能。
@@ -32,12 +34,21 @@ const pathAnchor = [
 	'\t\t\t\t设置反代IP(路径反代值);',
 ].join('\n');
 
+const SocketsAnchor = [
+	'\t\t\tconst initialSocket = await connectDirect(host, portNum, rawData, true);',
+].join('\n');
+
 if (!src.includes(queryAnchor)) {
 	console.error('overlay failed: 找不到查询反代IP锚点，上游可能改了 反代参数获取()');
 	process.exit(1);
 }
 if (!src.includes(pathAnchor)) {
 	console.error('overlay failed: 找不到路径反代值锚点，上游可能改了 反代参数获取()');
+	process.exit(1);
+}
+
+if (!src.includes(socketsAnchor)) {
+	console.error('overlay failed: 找不到 Cloudflare_Sockets 锚点，上游可能改了 connectDirect 调用');
 	process.exit(1);
 }
 
@@ -71,10 +82,18 @@ const pathReplaced = [
 	'\t\t\t\t设置反代IP(路径反代值);',
 ].join('\n');
 
+const SocketsReplaced = [
+	'\t\t\t// >>> LOCAL-CUSTOM: connectDirect-false',
+	'\t\t\tconst initialSocket = await connectDirect(host, portNum, rawData, false);',
+	'\t\t\t// <<< LOCAL-CUSTOM: connectDirect-false',
+].join('\n');
+
 src = src.replace(queryAnchor, queryReplaced);
 src = src.replace(pathAnchor, pathReplaced);
+src = src.replace(SocketsAnchor, SocketsReplaced);
 
-if (!src.includes('LOCAL-CUSTOM: random-proxyip') || !src.includes('路径反代值 = 随机抽取IP')) {
+
+if (!src.includes('LOCAL-CUSTOM: random-proxyip') || !src.includes('路径反代值 = 随机抽取IP') || !src.includes('LOCAL-CUSTOM: connectDirect-false')) {
 	console.error('overlay failed: 替换后校验未通过');
 	process.exit(1);
 }
