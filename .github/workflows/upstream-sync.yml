@@ -71,6 +71,12 @@ jobs:
           grep -Fq 'async function 处理WS请求' "$T/local.js"
           grep -Fq 'function MD5MD5' "$T/local.js"
 
+          # 确认 connectDirect 调用锚点存在，允许原始参数为 true 或 false。
+          grep -Eq 'const initialSocket = await connectDirect\(host, portNum, rawData, (true|false)\);' "$T/local.js" || {
+            echo "::error::本地 _worker.js 找不到 connectDirect 调用锚点"
+            exit 1
+          }
+
           # 确认本地工作流保护策略与备份文件存在。
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
@@ -190,6 +196,26 @@ jobs:
             exit "$WORKER_STATUS"
           fi
 
+          # 强制保留本地定制：connectDirect 第四个参数必须为 false。
+          CONNECT_DIRECT_TRUE='const initialSocket = await connectDirect(host, portNum, rawData, true);'
+          CONNECT_DIRECT_FALSE='const initialSocket = await connectDirect(host, portNum, rawData, false);'
+
+          if grep -Fq "$CONNECT_DIRECT_FALSE" _worker.js; then
+            echo 'connectDirect 第四个参数已经是 false，无需修改。'
+          elif grep -Fq "$CONNECT_DIRECT_TRUE" _worker.js; then
+            sed -i '/const initialSocket = await connectDirect(host, portNum, rawData, true);/s/rawData, true/rawData, false/' _worker.js
+            echo '已将 connectDirect 第四个参数修改为 false。'
+          else
+            echo "::error::找不到 connectDirect 调用锚点，无法安全应用本地定制。"
+            exit 1
+          fi
+
+          # 验证 connectDirect 定制结果。
+          grep -Fq "$CONNECT_DIRECT_FALSE" _worker.js || {
+            echo "::error::connectDirect 第四个参数定制验证失败。"
+            exit 1
+          }
+
           # 合并后的功能完整性、安全基线和语法检查。
           node --check _worker.js
           git diff --check
@@ -248,7 +274,11 @@ jobs:
           grep -Fq '管理员密码' _worker.js
           grep -Fq 'async function 处理WS请求' _worker.js
           grep -Fq 'function MD5MD5' _worker.js
-
+          grep -Fq 'const initialSocket = await connectDirect(host, portNum, rawData, false);' _worker.js || {
+            echo "::error::connectDirect 第四个参数不是 false"
+            exit 1
+          }
+          
           echo '=== 4. 工作流保护 ==='
           test -f .github/workflows/upstream-sync.yml
           test -f .github/workflows/Auto-close-empty-PRs.yml
