@@ -1,0 +1,355 @@
+
+name: Upstream Sync ceshi
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync cmliu/edgetunnel -> main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure Git and fetch remotes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/cmliu/edgetunnel.git
+          git fetch --prune origin main
+          git fetch --prune upstream main
+
+      - name: Lock main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git rev-parse HEAD)"
+          ORIGIN_SHA="$(git rev-parse origin/main)"
+          echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+          test "${BASE_SHA}" = "${ORIGIN_SHA}" || {
+            echo "::error::main 已发生变化，拒绝基于过期版本同步"
+            exit 1
+          }
+
+      - name: Preflight syntax, policy and merge tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${RUNNER_TEMP}/sync-preflight"
+          rm -rf "$T"
+          mkdir -p "$T"
+          trap 'rm -rf "$T"' EXIT
+
+          # 验证现有 Worker 语法与本地关键功能基线。
+          git show HEAD:_worker.js > "$T/local.js"
+          node --check "$T/local.js"
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' "$T/local.js"
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" "$T/local.js"
+          grep -Fq '路径反代值 = 随机抽取IP' "$T/local.js"
+          grep -Fq 'const uuidRegex' "$T/local.js"
+          grep -Fq '管理员密码' "$T/local.js"
+          grep -Fq 'async function 处理WS请求' "$T/local.js"
+          grep -Fq 'function MD5MD5' "$T/local.js"
+
+          # 确认 connectDirect 调用锚点存在，允许原始参数为 true 或 false。
+          grep -Eq 'const initialSocket = await connectDirect\(host, portNum, rawData, (true|false)\);' "$T/local.js" || {
+            echo "::error::本地 _worker.js 找不到 connectDirect 调用锚点"
+            exit 1
+          }
+
+          # 测试 connectDirect 第四个参数修改功能。
+          CONNECT_DIRECT_TRUE='const initialSocket = await connectDirect(host, portNum, rawData, true);'
+          CONNECT_DIRECT_FALSE='const initialSocket = await connectDirect(host, portNum, rawData, false);'
+
+          apply_connect_direct_override() {
+            local file="$1"
+
+            if grep -Fq "$CONNECT_DIRECT_FALSE" "$file"; then
+              echo "connectDirect 已经是 false，无需修改。"
+            elif grep -Fq "$CONNECT_DIRECT_TRUE" "$file"; then
+              sed -i '/const initialSocket = await connectDirect(host, portNum, rawData, true);/s/rawData, true/rawData, false/' "$file"
+              echo "已将 connectDirect 第四个参数修改为 false。"
+            else
+              echo "::error::找不到 connectDirect 调用锚点"
+              return 1
+            fi
+
+            grep -Fq "$CONNECT_DIRECT_FALSE" "$file" || {
+              echo "::error::connectDirect 参数修改验证失败"
+              return 1
+            }
+          }
+
+          # 测试一：true 必须修改为 false。
+          printf '%s\n' "$CONNECT_DIRECT_TRUE" > "$T/connect-direct-true.js"
+          apply_connect_direct_override "$T/connect-direct-true.js"
+          grep -Fq "$CONNECT_DIRECT_FALSE" "$T/connect-direct-true.js"
+          echo "通过：connectDirect true -> false"
+
+          # 测试二：已经是 false 时必须保持不变。
+          printf '%s\n' "$CONNECT_DIRECT_FALSE" > "$T/connect-direct-false.js"
+          apply_connect_direct_override "$T/connect-direct-false.js"
+          grep -Fq "$CONNECT_DIRECT_FALSE" "$T/connect-direct-false.js"
+          echo "通过：connectDirect false 保持不变"
+
+          # 测试三：找不到目标代码时必须失败。
+          printf '%s\n' 'const test = true;' > "$T/connect-direct-missing.js"
+          if apply_connect_direct_override "$T/connect-direct-missing.js"; then
+            echo "::error::测试失败：找不到目标代码却没有报错"
+            exit 1
+          else
+            echo "通过：找不到 connectDirect 锚点时正确失败"
+          fi
+
+          echo "connectDirect 修改功能测试全部通过。"
+
+          # 确认本地工作流保护策略与备份文件存在。
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
+          test ! -f .github/workflows/sync.yml
+
+          # 测试：不重叠修改必须自动合并。
+          printf 'a=BASE\nb=BASE\nc=BASE\n' > "$T/base"
+          printf 'a=LOCAL\nb=BASE\nc=BASE\n' > "$T/local"
+          printf 'a=BASE\nb=BASE\nc=UPSTREAM\n' > "$T/upstream"
+          cp "$T/local" "$T/positive"
+          git merge-file "$T/positive" "$T/base" "$T/upstream"
+          grep -Fq 'a=LOCAL' "$T/positive"
+          grep -Fq 'c=UPSTREAM' "$T/positive"
+
+          # 测试：真正的同一行冲突必须被识别并阻止。
+          printf 'value=BASE\n' > "$T/base-conflict"
+          printf 'value=LOCAL\n' > "$T/local-conflict"
+          printf 'value=UPSTREAM\n' > "$T/upstream-conflict"
+          cp "$T/local-conflict" "$T/conflict"
+          set +e
+          git merge-file --diff3 "$T/conflict" "$T/base-conflict" "$T/upstream-conflict"
+          STATUS=$?
+          set -e
+          test "$STATUS" -eq 1
+          grep -q '^<<<<<<<' "$T/conflict"
+          grep -q '^>>>>>>>' "$T/conflict"
+
+      - name: Check upstream status
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'up_to_date=true' >> "$GITHUB_OUTPUT"
+            echo '上游没有新提交，无需同步。'
+          else
+            echo 'up_to_date=false' >> "$GITHUB_OUTPUT"
+            echo "发现 $(git rev-list --count HEAD..upstream/main) 个上游新提交。"
+          fi
+
+      - name: Strict sync
+        id: sync
+        if: steps.upstream.outputs.up_to_date != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'changed=false' >> "$GITHUB_OUTPUT"
+          T="${RUNNER_TEMP}/sync-tmp"
+          rm -rf "$T"
+          mkdir -p "$T/local-workflows"
+          trap 'rm -rf "$T"' EXIT
+
+          WORKER_BASE="$(git merge-base HEAD upstream/main)"
+          git show HEAD:_worker.js > "$T/local.js"
+          git show "$WORKER_BASE:_worker.js" > "$T/base.js"
+          git show upstream/main:_worker.js > "$T/upstream.js"
+          cp -a .github/workflows/. "$T/local-workflows/"
+
+          # 合并上游；冲突文件逐个处理，普通文件以上游版本为准。
+          set +e
+          git merge --no-commit --no-ff --no-edit upstream/main
+          MERGE_STATUS=$?
+          set -e
+
+          if [ "$MERGE_STATUS" -ne 0 ]; then
+            mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
+            if [ "${#CONFLICTS[@]}" -eq 0 ]; then
+              git merge --abort || true
+              echo "::error::合并失败，但没有可处理的冲突文件"
+              exit 1
+            fi
+
+            for f in "${CONFLICTS[@]}"; do
+              case "$f" in
+                .github/workflows/*|_worker.js)
+                  # 工作流目录和 _worker.js 由专门逻辑处理。
+                  ;;
+                *)
+                  echo "普通文件冲突，采用上游版本：$f"
+                  if git cat-file -e "upstream/main:$f" 2>/dev/null; then
+                    git checkout --theirs -- "$f"
+                    git add -- "$f"
+                  else
+                    # 上游已删除该文件，按上游结果删除。
+                    git rm -f -- "$f" 2>/dev/null || true
+                  fi
+                  ;;
+              esac
+            done
+          fi
+
+          # 无条件恢复整个本地工作流目录，保护本地新增、修改、删除策略。
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp -a "$T/local-workflows/." .github/workflows/
+          git add -A .github/workflows
+
+          # _worker.js 使用三方合并；真实冲突立即停止。
+          mapfile -t REMAINING < <(git diff --name-only --diff-filter=U || true)
+          for f in "${REMAINING[@]}"; do
+            if [ "$f" != '_worker.js' ]; then
+              git merge --abort || true
+              echo "::error::发现未处理冲突：$f"
+              exit 1
+            fi
+          done
+
+          cp "$T/local.js" _worker.js
+          set +e
+          git merge-file --diff3 --marker-size=7 _worker.js "$T/base.js" "$T/upstream.js"
+          WORKER_STATUS=$?
+          set -e
+          if [ "$WORKER_STATUS" -ne 0 ]; then
+            git merge --abort || true
+            echo "::error::_worker.js 存在真实三方合并冲突，已停止同步"
+            exit "$WORKER_STATUS"
+          fi
+
+          # 强制保留本地定制：connectDirect 第四个参数必须为 false。
+          CONNECT_DIRECT_TRUE='const initialSocket = await connectDirect(host, portNum, rawData, true);'
+          CONNECT_DIRECT_FALSE='const initialSocket = await connectDirect(host, portNum, rawData, false);'
+
+          if grep -Fq "$CONNECT_DIRECT_FALSE" _worker.js; then
+            echo 'connectDirect 第四个参数已经是 false，无需修改。'
+          elif grep -Fq "$CONNECT_DIRECT_TRUE" _worker.js; then
+            sed -i '/const initialSocket = await connectDirect(host, portNum, rawData, true);/s/rawData, true/rawData, false/' _worker.js
+            echo '已将 connectDirect 第四个参数修改为 false。'
+          else
+            echo "::error::找不到 connectDirect 调用锚点，无法安全应用本地定制。"
+            exit 1
+          fi
+
+          # 验证 connectDirect 定制结果。
+          grep -Fq "$CONNECT_DIRECT_FALSE" _worker.js || {
+            echo "::error::connectDirect 第四个参数定制验证失败。"
+            exit 1
+          }
+
+          # 合并后的功能完整性、安全基线和语法检查。
+          node --check _worker.js
+          git diff --check
+          if grep -nE '^(<{7}|>{7})' _worker.js; then
+            echo "::error::_worker.js 存在冲突标记"
+            exit 1
+          fi
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' _worker.js
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" _worker.js
+          grep -Fq '路径反代值 = 随机抽取IP' _worker.js
+          grep -Fq 'const uuidRegex' _worker.js
+          grep -Fq '管理员密码' _worker.js
+          grep -Fq 'async function 处理WS请求' _worker.js
+          grep -Fq 'function MD5MD5' _worker.js
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
+          test ! -f .github/workflows/sync.yml
+
+          git add -A
+          if git diff --cached --quiet; then
+            [ ! -f .git/MERGE_HEAD ] || git merge --abort
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo '没有文件内容变化，无需创建空提交。'
+            exit 0
+          fi
+
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit -m 'sync: merge cmliu/edgetunnel and preserve local customizations'
+          else
+            git commit -m 'sync: merge cmliu/edgetunnel and preserve local customizations'
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Final validation
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo '=== 1. 工作区状态 ==='
+          git status --short
+          test -z "$(git status --porcelain)" || {
+            echo "::error::工作区不干净，拒绝推送"
+            exit 1
+          }
+
+          echo '=== 2. Worker 语法 ==='
+          node --check _worker.js
+
+          echo '=== 3. 定制功能与安全基线 ==='
+          grep -Fq 'LOCAL-CUSTOM: random-proxyip' _worker.js
+          grep -Fq "查询反代IP = searchParams.get('proxyip')" _worker.js
+          grep -Fq '路径反代值 = 随机抽取IP' _worker.js
+          grep -Fq 'const uuidRegex' _worker.js
+          grep -Fq '管理员密码' _worker.js
+          grep -Fq 'async function 处理WS请求' _worker.js
+          grep -Fq 'function MD5MD5' _worker.js
+          grep -Fq 'const initialSocket = await connectDirect(host, portNum, rawData, false);' _worker.js || {
+            echo "::error::connectDirect 第四个参数不是 false"
+            exit 1
+          }
+
+          echo '=== 4. 工作流保护 ==='
+          test -f .github/workflows/upstream-sync.yml
+          test -f .github/workflows/Auto-close-empty-PRs.yml
+          test -f .github/workflows/backups/upstream-sync.yml.bak
+          test ! -f .github/workflows/sync.yml
+
+          echo '=== FINAL VALIDATION OK ==='
+
+      - name: Final race check
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --prune origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "::error::同步期间 main 已被其他提交更新，拒绝推送"
+            exit 1
+          }
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA" || {
+            echo "::error::提交父节点与锁定基线不一致，拒绝推送"
+            exit 1
+          }
+
+      - name: Push main
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        run: git push origin HEAD:main
